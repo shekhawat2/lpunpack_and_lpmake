@@ -32,10 +32,6 @@
 #include <errno.h>
 #endif
 
-#if defined(__linux__)
-#include <sys/uio.h>
-#endif
-
 #include <atomic>
 #include <iostream>
 #include <limits>
@@ -60,18 +56,15 @@
 #include <android-base/strings.h>
 #include <android-base/threads.h>
 
-#include "liblog_symbols.h"
 #include "logging_splitters.h"
 
 namespace android {
 namespace base {
 
 // BSD-based systems like Android/macOS have getprogname(). Others need us to provide one.
-#if defined(__GLIBC__) || defined(_WIN32)
+#if !defined(__APPLE__) && !defined(__BIONIC__)
 static const char* getprogname() {
-#if defined(__GLIBC__)
-  return program_invocation_short_name;
-#elif defined(_WIN32)
+#ifdef _WIN32
   static bool first = true;
   static char progname[MAX_PATH] = {};
 
@@ -82,6 +75,8 @@ static const char* getprogname() {
   }
 
   return progname;
+#else
+  return program_invocation_short_name;
 #endif
 }
 #endif
@@ -105,7 +100,7 @@ static const char* GetFileBasename(const char* file) {
 #if defined(__linux__)
 static int OpenKmsg() {
 #if defined(__ANDROID__)
-  // pick up 'file w /dev/kmsg' environment from daemon's init rc file
+  // pick up 'file /dev/kmsg w' environment from daemon's init rc file
   const auto val = getenv("ANDROID_FILE__dev_kmsg");
   if (val != nullptr) {
     int fd;
@@ -214,9 +209,8 @@ static std::recursive_mutex& TagLock() {
 static std::string* gDefaultTag;
 
 void SetDefaultTag(const std::string& tag) {
-  static auto& liblog_functions = GetLibLogFunctions();
-  if (liblog_functions) {
-    liblog_functions->__android_log_set_default_tag(tag.c_str());
+  if (__builtin_available(android 30, *)) {
+    __android_log_set_default_tag(tag.c_str());
   } else {
     std::lock_guard<std::recursive_mutex> lock(TagLock());
     if (gDefaultTag != nullptr) {
@@ -257,20 +251,22 @@ static void KernelLogLine(const char* msg, int length, android::base::LogSeverit
 
   int level = kLogSeverityToKernelLogLevel[severity];
 
-  // The kernel's printk buffer is only 1024 bytes.
-  // TODO: should we automatically break up long lines into multiple lines?
-  // Or we could log but with something like "..." at the end?
-  char buf[1024] __attribute__((__uninitialized__));
+  // The kernel's printk buffer is only |1024 - PREFIX_MAX| bytes, where
+  // PREFIX_MAX could be 48 or 32.
+  // Reference: kernel/printk/printk.c
+  static constexpr int LOG_LINE_MAX = 1024 - 48;
+  char buf[LOG_LINE_MAX] __attribute__((__uninitialized__));
   size_t size = snprintf(buf, sizeof(buf), "<%d>%s: %.*s\n", level, tag, length, msg);
-  if (size > sizeof(buf)) {
-    size = snprintf(buf, sizeof(buf), "<%d>%s: %zu-byte message too long for printk\n",
-                    level, tag, size);
-  }
+  TEMP_FAILURE_RETRY(write(klog_fd, buf, std::min(size, sizeof(buf))));
 
-  iovec iov[1];
-  iov[0].iov_base = buf;
-  iov[0].iov_len = size;
-  TEMP_FAILURE_RETRY(writev(klog_fd, iov, 1));
+  if (size > sizeof(buf)) {
+    size_t truncated = size - sizeof(buf);
+    size = snprintf(
+        buf, sizeof(buf),
+        "<%d>%s: **previous message missing %zu bytes** %zu-byte message too long for printk\n",
+        level, tag, truncated, size);
+    TEMP_FAILURE_RETRY(write(klog_fd, buf, std::min(size, sizeof(buf))));
+  }
 }
 
 void KernelLogger(android::base::LogId, android::base::LogSeverity severity, const char* tag,
@@ -318,11 +314,10 @@ static void LogdLogChunk(LogId id, LogSeverity severity, const char* tag, const 
   int32_t lg_id = LogIdTolog_id_t(id);
   int32_t priority = LogSeverityToPriority(severity);
 
-  static auto& liblog_functions = GetLibLogFunctions();
-  if (liblog_functions) {
+  if (__builtin_available(android 30, *)) {
     __android_log_message log_message = {sizeof(__android_log_message),     lg_id, priority, tag,
                                          static_cast<const char*>(nullptr), 0,     message};
-    liblog_functions->__android_log_logd_logger(&log_message);
+    __android_log_logd_logger(&log_message);
   } else {
     __android_log_buf_print(lg_id, priority, tag, "%s", message);
   }
@@ -385,8 +380,8 @@ void InitLogging(char* argv[], LogFunction&& logger, AbortFunction&& aborter) {
         case 'f':
           SetMinimumLogSeverity(FATAL_WITHOUT_ABORT);
           continue;
-        // liblog will even suppress FATAL if you say 's' for silent, but that's
-        // crazy!
+        // liblog will even suppress FATAL if you say 's' for silent, but fatal should
+        // never be suppressed.
         case 's':
           SetMinimumLogSeverity(FATAL_WITHOUT_ABORT);
           continue;
@@ -397,12 +392,12 @@ void InitLogging(char* argv[], LogFunction&& logger, AbortFunction&& aborter) {
   }
 }
 
-void SetLogger(LogFunction&& logger) {
+LogFunction SetLogger(LogFunction&& logger) {
+  LogFunction old_logger = std::move(Logger());
   Logger() = std::move(logger);
 
-  static auto& liblog_functions = GetLibLogFunctions();
-  if (liblog_functions) {
-    liblog_functions->__android_log_set_logger([](const struct __android_log_message* log_message) {
+  if (__builtin_available(android 30, *)) {
+    __android_log_set_logger([](const struct __android_log_message* log_message) {
       auto log_id = log_id_tToLogId(log_message->buffer_id);
       auto severity = PriorityToLogSeverity(log_message->priority);
 
@@ -410,16 +405,17 @@ void SetLogger(LogFunction&& logger) {
                log_message->message);
     });
   }
+  return old_logger;
 }
 
-void SetAborter(AbortFunction&& aborter) {
+AbortFunction SetAborter(AbortFunction&& aborter) {
+  AbortFunction old_aborter = std::move(Aborter());
   Aborter() = std::move(aborter);
 
-  static auto& liblog_functions = GetLibLogFunctions();
-  if (liblog_functions) {
-    liblog_functions->__android_log_set_aborter(
-        [](const char* abort_message) { Aborter()(abort_message); });
+  if (__builtin_available(android 30, *)) {
+    __android_log_set_aborter([](const char* abort_message) { Aborter()(abort_message); });
   }
+  return old_aborter;
 }
 
 // This indirection greatly reduces the stack impact of having lots of
@@ -504,9 +500,8 @@ LogMessage::~LogMessage() {
 
   // Abort if necessary.
   if (data_->GetSeverity() == FATAL) {
-    static auto& liblog_functions = GetLibLogFunctions();
-    if (liblog_functions) {
-      liblog_functions->__android_log_call_aborter(msg.c_str());
+    if (__builtin_available(android 30, *)) {
+      __android_log_call_aborter(msg.c_str());
     } else {
       Aborter()(msg.c_str());
     }
@@ -519,12 +514,11 @@ std::ostream& LogMessage::stream() {
 
 void LogMessage::LogLine(const char* file, unsigned int line, LogSeverity severity, const char* tag,
                          const char* message) {
-  static auto& liblog_functions = GetLibLogFunctions();
   int32_t priority = LogSeverityToPriority(severity);
-  if (liblog_functions) {
+  if (__builtin_available(android 30, *)) {
     __android_log_message log_message = {
         sizeof(__android_log_message), LOG_ID_DEFAULT, priority, tag, file, line, message};
-    liblog_functions->__android_log_write_log_message(&log_message);
+    __android_log_write_log_message(&log_message);
   } else {
     if (tag == nullptr) {
       std::lock_guard<std::recursive_mutex> lock(TagLock());
@@ -540,20 +534,18 @@ void LogMessage::LogLine(const char* file, unsigned int line, LogSeverity severi
 }
 
 LogSeverity GetMinimumLogSeverity() {
-  static auto& liblog_functions = GetLibLogFunctions();
-  if (liblog_functions) {
-    return PriorityToLogSeverity(liblog_functions->__android_log_get_minimum_priority());
+  if (__builtin_available(android 30, *)) {
+    return PriorityToLogSeverity(__android_log_get_minimum_priority());
   } else {
     return gMinimumLogSeverity;
   }
 }
 
 bool ShouldLog(LogSeverity severity, const char* tag) {
-  static auto& liblog_functions = GetLibLogFunctions();
   // Even though we're not using the R liblog functions in this function, if we're running on Q,
   // we need to fall back to using gMinimumLogSeverity, since __android_log_is_loggable() will not
   // take into consideration the value from SetMinimumLogSeverity().
-  if (liblog_functions) {
+  if (__builtin_available(android 30, *)) {
     int32_t priority = LogSeverityToPriority(severity);
     return __android_log_is_loggable(priority, tag, ANDROID_LOG_INFO);
   } else {
@@ -562,10 +554,9 @@ bool ShouldLog(LogSeverity severity, const char* tag) {
 }
 
 LogSeverity SetMinimumLogSeverity(LogSeverity new_severity) {
-  static auto& liblog_functions = GetLibLogFunctions();
-  if (liblog_functions) {
+  if (__builtin_available(android 30, *)) {
     int32_t priority = LogSeverityToPriority(new_severity);
-    return PriorityToLogSeverity(liblog_functions->__android_log_set_minimum_priority(priority));
+    return PriorityToLogSeverity(__android_log_set_minimum_priority(priority));
   } else {
     LogSeverity old_severity = gMinimumLogSeverity;
     gMinimumLogSeverity = new_severity;

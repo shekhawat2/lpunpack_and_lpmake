@@ -241,6 +241,45 @@ TEST(RefBase, ReplacedComparison) {
     ASSERT_FALSE(wp1 != wp2);
 }
 
+TEST(RefBase, AssertWeakRefExistsSuccess) {
+    bool isDeleted;
+    sp<Foo> foo = sp<Foo>::make(&isDeleted);
+    wp<Foo> weakFoo = foo;
+
+    EXPECT_EQ(weakFoo, wp<Foo>::fromExisting(foo.get()));
+    EXPECT_EQ(weakFoo.unsafe_get(), wp<Foo>::fromExisting(foo.get()).unsafe_get());
+
+    EXPECT_FALSE(isDeleted);
+    foo = nullptr;
+    EXPECT_TRUE(isDeleted);
+}
+
+TEST(RefBase, AssertWeakRefExistsDeath) {
+    // uses some other refcounting method, or none at all
+    bool isDeleted;
+    Foo* foo = new Foo(&isDeleted);
+
+    // can only get a valid wp<> object when you construct it from an sp<>
+    EXPECT_DEATH(wp<Foo>::fromExisting(foo), "");
+
+    delete foo;
+}
+
+TEST(RefBase, DoubleOwnershipDeath) {
+    bool isDeleted;
+    auto foo = sp<Foo>::make(&isDeleted);
+
+    // if something else thinks it owns foo, should die
+    EXPECT_DEATH(delete foo.get(), "");
+
+    EXPECT_FALSE(isDeleted);
+}
+
+TEST(RefBase, StackOwnershipDeath) {
+    bool isDeleted;
+    EXPECT_DEATH({ Foo foo(&isDeleted); foo.incStrong(nullptr); }, "");
+}
+
 // Set up a situation in which we race with visit2AndRremove() to delete
 // 2 strong references.  Bar destructor checks that there are no early
 // deletions and prior updates are visible to destructor.

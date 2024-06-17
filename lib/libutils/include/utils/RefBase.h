@@ -140,7 +140,9 @@
 // count, and accidentally passed to f(sp<T>), a strong pointer to the object
 // will be temporarily constructed and destroyed, prematurely deallocating the
 // object, and resulting in heap corruption. None of this would be easily
-// visible in the source.
+// visible in the source. See below on
+// ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION for a compile time
+// option which helps avoid this case.
 
 // Extra Features:
 
@@ -167,11 +169,48 @@
 // to THE SAME sp<> or wp<>.  In effect, their thread-safety properties are
 // exactly like those of T*, NOT atomic<T*>.
 
+// Safety option: ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION
+//
+// This flag makes the semantics for using a RefBase object with wp<> and sp<>
+// much stricter by disabling implicit conversion from raw pointers to these
+// objects. In order to use this, apply this flag in Android.bp like so:
+//
+//    cflags: [
+//        "-DANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION",
+//    ],
+//
+// REGARDLESS of whether this flag is on, best usage of sp<> is shown below. If
+// this flag is on, no other usage is possible (directly calling RefBase methods
+// is possible, but seeing code using 'incStrong' instead of 'sp<>', for
+// instance, should already set off big alarm bells. With carefully constructed
+// data structures, it should NEVER be necessary to directly use RefBase
+// methods). Proper RefBase usage:
+//
+//    class Foo : virtual public RefBase { ... };
+//
+//    // always construct an sp object with sp::make
+//    sp<Foo> myFoo = sp<Foo>::make(/*args*/);
+//
+//    // if you need a weak pointer, it must be constructed from a strong
+//    // pointer
+//    wp<Foo> weakFoo = myFoo; // NOT myFoo.get()
+//
+//    // If you are inside of a method of Foo and need access to a strong
+//    // explicitly call this function. This documents your intention to code
+//    // readers, and it will give a runtime error for what otherwise would
+//    // be potential double ownership
+//    .... Foo::someMethod(...) {
+//        // asserts if there is a memory issue
+//        sp<Foo> thiz = sp<Foo>::fromExisting(this);
+//    }
+//
+
 #ifndef ANDROID_REF_BASE_H
 #define ANDROID_REF_BASE_H
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <type_traits>  // for common_type.
 
 #include <stdint.h>
@@ -244,6 +283,7 @@ class RefBase
 {
 public:
             void            incStrong(const void* id) const;
+            void            incStrongRequireStrong(const void* id) const;
             void            decStrong(const void* id) const;
     
             void            forceIncStrong(const void* id) const;
@@ -257,6 +297,7 @@ public:
         RefBase*            refBase() const;
 
         void                incWeak(const void* id);
+        void                incWeakRequireWeak(const void* id);
         void                decWeak(const void* id);
 
         // acquires a strong reference if there is already one.
@@ -297,6 +338,11 @@ public:
     }
 
 protected:
+    // When constructing these objects, prefer using sp::make<>. Using a RefBase
+    // object on the stack or with other refcount mechanisms (e.g.
+    // std::shared_ptr) is inherently wrong. RefBase types have an implicit
+    // ownership model and cannot be safely used with other ownership models.
+
                             RefBase();
     virtual                 ~RefBase();
     
@@ -360,10 +406,27 @@ public:
 
     inline wp() : m_ptr(nullptr), m_refs(nullptr) { }
 
+    // if nullptr, returns nullptr
+    //
+    // if a weak pointer is already available, this will retrieve it,
+    // otherwise, this will abort
+    static inline wp<T> fromExisting(T* other);
+
+    // for more information about this flag, see above
+#if defined(ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION)
+    wp(std::nullptr_t) : wp() {}
+#else
     wp(T* other);  // NOLINT(implicit)
+    template <typename U>
+    wp(U* other);  // NOLINT(implicit)
+    wp& operator=(T* other);
+    template <typename U>
+    wp& operator=(U* other);
+#endif
+
     wp(const wp<T>& other);
     explicit wp(const sp<T>& other);
-    template<typename U> wp(U* other);  // NOLINT(implicit)
+
     template<typename U> wp(const sp<U>& other);  // NOLINT(implicit)
     template<typename U> wp(const wp<U>& other);  // NOLINT(implicit)
 
@@ -371,11 +434,9 @@ public:
 
     // Assignment
 
-    wp& operator = (T* other);
     wp& operator = (const wp<T>& other);
     wp& operator = (const sp<T>& other);
 
-    template<typename U> wp& operator = (U* other);
     template<typename U> wp& operator = (const wp<U>& other);
     template<typename U> wp& operator = (const sp<U>& other);
 
@@ -476,12 +537,52 @@ private:
 // Note that the above comparison operations go out of their way to provide an ordering consistent
 // with ordinary pointer comparison; otherwise they could ignore m_ptr, and just compare m_refs.
 
+template <typename T>
+wp<T> wp<T>::fromExisting(T* other) {
+    if (!other) return nullptr;
+
+    auto refs = other->getWeakRefs();
+    refs->incWeakRequireWeak(other);
+
+    wp<T> ret;
+    ret.m_ptr = other;
+    ret.m_refs = refs;
+    return ret;
+}
+
+#if !defined(ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION)
 template<typename T>
 wp<T>::wp(T* other)
     : m_ptr(other)
 {
     m_refs = other ? m_refs = other->createWeak(this) : nullptr;
 }
+
+template <typename T>
+template <typename U>
+wp<T>::wp(U* other) : m_ptr(other) {
+    m_refs = other ? other->createWeak(this) : nullptr;
+}
+
+template <typename T>
+wp<T>& wp<T>::operator=(T* other) {
+    weakref_type* newRefs = other ? other->createWeak(this) : nullptr;
+    if (m_ptr) m_refs->decWeak(this);
+    m_ptr = other;
+    m_refs = newRefs;
+    return *this;
+}
+
+template <typename T>
+template <typename U>
+wp<T>& wp<T>::operator=(U* other) {
+    weakref_type* newRefs = other ? other->createWeak(this) : 0;
+    if (m_ptr) m_refs->decWeak(this);
+    m_ptr = other;
+    m_refs = newRefs;
+    return *this;
+}
+#endif
 
 template<typename T>
 wp<T>::wp(const wp<T>& other)
@@ -495,13 +596,6 @@ wp<T>::wp(const sp<T>& other)
     : m_ptr(other.m_ptr)
 {
     m_refs = m_ptr ? m_ptr->createWeak(this) : nullptr;
-}
-
-template<typename T> template<typename U>
-wp<T>::wp(U* other)
-    : m_ptr(other)
-{
-    m_refs = other ? other->createWeak(this) : nullptr;
 }
 
 template<typename T> template<typename U>
@@ -530,17 +624,6 @@ wp<T>::~wp()
 }
 
 template<typename T>
-wp<T>& wp<T>::operator = (T* other)
-{
-    weakref_type* newRefs =
-        other ? other->createWeak(this) : nullptr;
-    if (m_ptr) m_refs->decWeak(this);
-    m_ptr = other;
-    m_refs = newRefs;
-    return *this;
-}
-
-template<typename T>
 wp<T>& wp<T>::operator = (const wp<T>& other)
 {
     weakref_type* otherRefs(other.m_refs);
@@ -560,17 +643,6 @@ wp<T>& wp<T>::operator = (const sp<T>& other)
     T* otherPtr(other.m_ptr);
     if (m_ptr) m_refs->decWeak(this);
     m_ptr = otherPtr;
-    m_refs = newRefs;
-    return *this;
-}
-
-template<typename T> template<typename U>
-wp<T>& wp<T>::operator = (U* other)
-{
-    weakref_type* newRefs =
-        other ? other->createWeak(this) : 0;
-    if (m_ptr) m_refs->decWeak(this);
-    m_ptr = other;
     m_refs = newRefs;
     return *this;
 }
@@ -707,6 +779,40 @@ void move_backward_type(wp<TYPE>* d, wp<TYPE> const* s, size_t n) {
 }
 
 }  // namespace android
+
+namespace libutilsinternal {
+template <typename T, typename = void>
+struct is_complete_type : std::false_type {};
+
+template <typename T>
+struct is_complete_type<T, decltype(void(sizeof(T)))> : std::true_type {};
+}  // namespace libutilsinternal
+
+namespace std {
+
+// Define `RefBase` specific versions of `std::make_shared` and
+// `std::make_unique` to block people from using them. Using them to allocate
+// `RefBase` objects results in double ownership. Use
+// `sp<T>::make(...)` instead.
+//
+// Note: We exclude incomplete types because `std::is_base_of` is undefined in
+// that case.
+
+template <typename T, typename... Args,
+          typename std::enable_if<libutilsinternal::is_complete_type<T>::value, bool>::value = true,
+          typename std::enable_if<std::is_base_of<android::RefBase, T>::value, bool>::value = true>
+shared_ptr<T> make_shared(Args...) {  // SEE COMMENT ABOVE.
+    static_assert(!std::is_base_of<android::RefBase, T>::value, "Must use RefBase with sp<>");
+}
+
+template <typename T, typename... Args,
+          typename std::enable_if<libutilsinternal::is_complete_type<T>::value, bool>::value = true,
+          typename std::enable_if<std::is_base_of<android::RefBase, T>::value, bool>::value = true>
+unique_ptr<T> make_unique(Args...) {  // SEE COMMENT ABOVE.
+    static_assert(!std::is_base_of<android::RefBase, T>::value, "Must use RefBase with sp<>");
+}
+
+}  // namespace std
 
 // ---------------------------------------------------------------------------
 

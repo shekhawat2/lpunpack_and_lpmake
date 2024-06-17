@@ -46,39 +46,34 @@ std::vector<std::string> Split(const std::string& s,
   return result;
 }
 
-std::string Trim(const std::string& s) {
-  std::string result;
+std::vector<std::string> Tokenize(const std::string& s, const std::string& delimiters) {
+  CHECK_NE(delimiters.size(), 0U);
 
-  if (s.size() == 0) {
-    return result;
-  }
+  std::vector<std::string> result;
+  size_t end = 0;
 
-  size_t start_index = 0;
-  size_t end_index = s.size() - 1;
-
-  // Skip initial whitespace.
-  while (start_index < s.size()) {
-    if (!isspace(s[start_index])) {
+  while (true) {
+    size_t base = s.find_first_not_of(delimiters, end);
+    if (base == s.npos) {
       break;
     }
-    start_index++;
+    end = s.find_first_of(delimiters, base);
+    result.push_back(s.substr(base, end - base));
   }
-
-  // Skip terminating whitespace.
-  while (end_index >= start_index) {
-    if (!isspace(s[end_index])) {
-      break;
-    }
-    end_index--;
-  }
-
-  // All spaces, no beef.
-  if (end_index < start_index) {
-    return "";
-  }
-  // Start_index is the first non-space, end_index is the last one.
-  return s.substr(start_index, end_index - start_index + 1);
+  return result;
 }
+
+[[deprecated("Retained only for binary compatibility (symbol name)")]]
+std::string Trim(const std::string& s) {
+  return Trim(std::string_view(s));
+}
+
+template std::string Trim(const char*&);
+template std::string Trim(const char*&&);
+template std::string Trim(const std::string&);
+template std::string Trim(const std::string&&);
+template std::string Trim(std::string_view&);
+template std::string Trim(std::string_view&&);
 
 // These cases are probably the norm, so we mark them extern in the header to
 // aid compile time and binary size.

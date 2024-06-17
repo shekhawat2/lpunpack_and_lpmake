@@ -122,7 +122,8 @@ static bool check_vendor_memfd_allowed() {
         return true;
     }
 
-    /* If its not a number, assume string, but check if its a sane string */
+    // Non-numeric should be a single ASCII character. Characters after the
+    // first are ignored.
     if (tolower(vndk_version[0]) < 'a' || tolower(vndk_version[0]) > 'z') {
         ALOGE("memfd: ro.vndk.version not defined or invalid (%s), this is mandated since P.\n",
               vndk_version.c_str());
@@ -158,9 +159,11 @@ static bool __has_memfd_support() {
         return false;
     }
 
-    /* Check if kernel support exists, otherwise fall back to ashmem */
+    // Check if kernel support exists, otherwise fall back to ashmem.
+    // This code needs to build on old API levels, so we can't use the libc
+    // wrapper.
     android::base::unique_fd fd(
-            syscall(__NR_memfd_create, "test_android_memfd", MFD_ALLOW_SEALING));
+            syscall(__NR_memfd_create, "test_android_memfd", MFD_CLOEXEC | MFD_ALLOW_SEALING));
     if (fd == -1) {
         ALOGE("memfd_create failed: %s, no memfd support.\n", strerror(errno));
         return false;
@@ -211,13 +214,16 @@ static int __ashmem_open_locked()
 
     // fallback for APEX w/ use_vendor on Q, which would have still used /dev/ashmem
     if (fd < 0) {
+        int saved_errno = errno;
         fd = TEMP_FAILURE_RETRY(open("/dev/ashmem", O_RDWR | O_CLOEXEC));
+        if (fd < 0) {
+            /* Q launching devices and newer must not reach here since they should have been
+             * able to open ashmem_device_path */
+            ALOGE("Unable to open ashmem device %s (error = %s) and /dev/ashmem(error = %s)",
+                  ashmem_device_path.c_str(), strerror(saved_errno), strerror(errno));
+            return fd;
+        }
     }
-
-    if (fd < 0) {
-        return fd;
-    }
-
     struct stat st;
     int ret = TEMP_FAILURE_RETRY(fstat(fd, &st));
     if (ret < 0) {
@@ -329,7 +335,9 @@ int ashmem_valid(int fd)
 }
 
 static int memfd_create_region(const char* name, size_t size) {
-    android::base::unique_fd fd(syscall(__NR_memfd_create, name, MFD_ALLOW_SEALING));
+    // This code needs to build on old API levels, so we can't use the libc
+    // wrapper.
+    android::base::unique_fd fd(syscall(__NR_memfd_create, name, MFD_CLOEXEC | MFD_ALLOW_SEALING));
 
     if (fd == -1) {
         ALOGE("memfd_create(%s, %zd) failed: %s\n", name, size, strerror(errno));
@@ -338,6 +346,12 @@ static int memfd_create_region(const char* name, size_t size) {
 
     if (ftruncate(fd, size) == -1) {
         ALOGE("ftruncate(%s, %zd) failed for memfd creation: %s\n", name, size, strerror(errno));
+        return -1;
+    }
+
+    // forbid size changes to match ashmem behaviour
+    if (fcntl(fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK) == -1) {
+        ALOGE("memfd_create(%s, %zd) F_ADD_SEALS failed: %m", name, size);
         return -1;
     }
 
@@ -392,14 +406,29 @@ error:
 }
 
 static int memfd_set_prot_region(int fd, int prot) {
-    /* Only proceed if an fd needs to be write-protected */
+    int seals = fcntl(fd, F_GET_SEALS);
+    if (seals == -1) {
+        ALOGE("memfd_set_prot_region(%d, %d): F_GET_SEALS failed: %s\n", fd, prot, strerror(errno));
+        return -1;
+    }
+
     if (prot & PROT_WRITE) {
+        /* Now we want the buffer to be read-write, let's check if the buffer
+         * has been previously marked as read-only before, if so return error
+         */
+        if (seals & F_SEAL_FUTURE_WRITE) {
+            ALOGE("memfd_set_prot_region(%d, %d): region is write protected\n", fd, prot);
+            errno = EINVAL;  // inline with ashmem error code, if already in
+                             // read-only mode
+            return -1;
+        }
         return 0;
     }
 
-    if (fcntl(fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE) == -1) {
-        ALOGE("memfd_set_prot_region(%d, %d): F_SEAL_FUTURE_WRITE seal failed: %s\n", fd, prot,
-              strerror(errno));
+    /* We would only allow read-only for any future file operations */
+    if (fcntl(fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE | F_SEAL_SEAL) == -1) {
+        ALOGE("memfd_set_prot_region(%d, %d): F_SEAL_FUTURE_WRITE | F_SEAL_SEAL seal failed: %s\n",
+              fd, prot, strerror(errno));
         return -1;
     }
 
